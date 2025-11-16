@@ -6,7 +6,7 @@ This folder contains scripts for generating transcripts from audio/video files u
 
 ## Setup
 The diarization pipeline requires hugging face token authentication. Make sure to create a profile on hugging face, and get a token. Input this token in the config file.
-Before running any scripts, install the required Python packages using the provided `sync_requirements.txt` file. Ensure python 3.11 is installed on your machine!
+Before running any scripts, install the required Python packages using the provided `requirements.txt` file. Ensure python 3.11 is installed on your machine and ffmpeg too!
 
 ### Windows (PowerShell)
 ```powershell
@@ -27,7 +27,7 @@ The main script is `transcribe.py`. It takes audio or video files and generates 
 
 ### Example command
 ```bash
-python transcribe.py --input /path/to/audio_or_video_file --output /path/to/output_transcript.txt
+python transcribe.py --input /path/to/audio_or_video_file --output /path/to/output_transcript
 ```
 
 - `--input`: Path to the audio or video file to transcribe.
