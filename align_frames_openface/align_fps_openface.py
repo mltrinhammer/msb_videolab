@@ -23,9 +23,12 @@ Y_i + (Y{i+1} − Y_i) --> how much does the new AU values change between two kn
 
 We thus compute a weighted average of the two smoothed neighbor values, weighted according to how far away the target value was between its neighbors.
 
-python source/scripts_source_data_clean/align_fps.py --in /home/data_shares/genface/data/MentalHealth/msb/OpenFace_Output_MSB/ --out /home/data_shares/
-genface/data/MentalHealth/msb/ --target-fps 30 --frame-info /home/data_shares/genface/data
-/MentalHealth/msb/frame_info.xlsx
+NOTE on binary AU-presence columns (AU06_c, AU12_c, ... — the "_c" flags):
+These are categorical 0/1 detections, NOT continuous signals, so the smoothing +
+linear-interpolation above is inappropriate for them (it turns 0/1 into fractional
+values that then get re-thresholded downstream, shifting or erasing brief smiles).
+They are therefore resampled by nearest original sample instead, which preserves
+the 0/1 detections exactly. The continuous intensity ("_r") scores are unchanged.
 
 the --in argument specifies the path where all the .csv files should be located, you know, the openface outputs
 the --target-fps specifies the target fps rate
@@ -38,6 +41,7 @@ In addition an "align_fps_log.txt" is created which stores one line pr file desi
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +49,15 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+
+
+# OpenFace AU *presence* columns (binary 0/1 detections, e.g. AU06_c, AU12_c).
+# These are categorical flags, not continuous signals, so they are resampled with
+# a label-preserving nearest-neighbour lookup rather than the rolling-mean +
+# linear-interpolation smoothing used for the continuous columns (intensity _r,
+# gaze, pose, ...). Smoothing a 0/1 flag would blend it into fractional values
+# and shift/erase brief detections once it is re-thresholded downstream.
+PRESENCE_COL_RE = re.compile(r"^AU\d{2}_c$")
 
 
 # ------------------------------
@@ -149,30 +162,63 @@ def _compute_time_axis_from_timestamp(df: pd.DataFrame) -> Tuple[np.ndarray, str
 	return times, ts_col, fr_col
 
 
+def _nearest_onto(times_src: np.ndarray, y_src: np.ndarray, grid: np.ndarray) -> np.ndarray:
+	"""Nearest-neighbour resample of y_src (sampled at times_src) onto grid.
+
+	Unlike linear interpolation this never blends neighbouring samples, so a
+	binary 0/1 presence signal stays exactly 0/1. ``times_src`` must be sorted
+	ascending. NaN source samples are dropped before the lookup; if every sample
+	is NaN the result is all-NaN.
+	"""
+	m = ~np.isnan(times_src) & ~np.isnan(y_src)
+	if not m.any():
+		return np.full(grid.shape, np.nan, dtype=float)
+	ts, y = times_src[m], y_src[m]
+	idx = np.searchsorted(ts, grid, side="left")
+	idx = np.clip(idx, 0, ts.size - 1)
+	prev = np.clip(idx - 1, 0, ts.size - 1)
+	# whichever of {prev, idx} is closer in time to the grid point
+	choose_prev = np.abs(grid - ts[prev]) <= np.abs(ts[idx] - grid)
+	nearest_idx = np.where(choose_prev, prev, idx)
+	return y[nearest_idx]
+
+
 def resample_to_target(df: pd.DataFrame, src_fps: float, target_fps: float = 24.0) -> pd.DataFrame:
 	"""Resample dataframe to target fps using rolling-mean (pandas.rolling) smoothing plus interpolation on 'timestamp' (np.interp).
 
 	- Recompute 'timestamp' and 'frame' (if present originally, frame is regenerated)
 	- Preserve column order from the original
-	- Non-numeric columns are aligned by nearest original sample
+	- Continuous numeric columns (intensity _r, gaze, pose, ...) are smoothed +
+	  linearly interpolated as described above.
+	- Binary AU-presence columns (``AU\\d\\d_c``) are instead resampled by
+	  nearest original sample, so the 0/1 detections are preserved (no smoothing,
+	  no fractional blending). Intensity scores are untouched by this.
+	- Other non-numeric columns are aligned by nearest original sample.
 	"""
 	# Clean headers for whitespace and similiar
 	df = df.copy()
 	df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
 
-	times_old, ts_col, fr_col = _compute_time_axis_from_timestamp(df)
-	t0 = times_old[0] #to account for the few cases where first timesteps may not be 0
-	times_rel = times_old - t0 #original timesteps
+	# Detect the timestamp / frame column names (values recomputed from the
+	# SORTED frame below so the time axis is guaranteed ascending).
+	_, ts_col, fr_col = _compute_time_axis_from_timestamp(df)
 
-	# Sort the dataframe by timestamp to align values with times_rel
+	# Sort by timestamp FIRST, then derive the time axis from the sorted rows so
+	# per-row values (df_sorted[col]) and their times (times_rel) stay aligned even
+	# if a CSV is not already monotonic. Both np.interp (continuous cols) and the
+	# nearest-neighbour lookup (presence cols) require an ascending, values-aligned
+	# time axis. For the OpenFace inputs (already monotonic, starting at 0) this is
+	# identical to the previous behaviour.
 	df_sorted = df.sort_values(by=ts_col).reset_index(drop=True)
+	times_rel = pd.to_numeric(df_sorted[ts_col], errors="raise").to_numpy(dtype=float)
+	t0 = times_rel[0]  # first (= smallest, after sort) timestamp; handles nonzero start
+	times_rel = times_rel - t0
 
 	t_end = times_rel[-1]
 	# Compute number of new frames n_new and create the new timestep grid new_rel
 	n_new = int(np.floor(t_end * target_fps)) + 1 
 	new_rel = np.arange(n_new, dtype=float) / float(target_fps) #the new time steps
 	new_rel = np.round(new_rel, 6) #many decimals when going from, for instance 60 fps to 24
-	new_abs = t0 + new_rel
 
 	# Identify columns
 	original_cols = list(df.columns)
@@ -180,7 +226,15 @@ def resample_to_target(df: pd.DataFrame, src_fps: float, target_fps: float = 24.
 	# Separate numeric and non-numeric (exclude frame/timestamp from numeric set)
 	numeric_cols = df_sorted.select_dtypes(include=[np.number]).columns.tolist()
 	numeric_cols = [c for c in numeric_cols if c not in {ts_col, fr_col}]
-	non_numeric_cols = [c for c in original_cols if c not in numeric_cols]
+
+	# Pull binary AU-presence columns out of the smoothing path; they are
+	# resampled nearest-neighbour below so 0/1 flags stay intact. Continuous
+	# columns (including the intensity _r scores) remain in ``numeric_cols`` and
+	# are processed exactly as before.
+	presence_cols = [c for c in numeric_cols if PRESENCE_COL_RE.match(c)]
+	numeric_cols = [c for c in numeric_cols if c not in presence_cols]
+
+	non_numeric_cols = [c for c in original_cols if c not in numeric_cols and c not in presence_cols]
 	if ts_col in non_numeric_cols:
 		non_numeric_cols.remove(ts_col)
 	if fr_col and fr_col in non_numeric_cols:
@@ -210,8 +264,15 @@ def resample_to_target(df: pd.DataFrame, src_fps: float, target_fps: float = 24.
 		if np.isnan(y).any():
 			idx = np.arange(len(y), dtype=float)
 			y = np.interp(idx, idx[mask], y[mask])
-		interp_data[col] = np.interp(new_rel, times_rel, y) 
+		interp_data[col] = np.interp(new_rel, times_rel, y)
 		#new_rel --> vector of new timesteps, times_rel --> original timesteps, y--> values after rolling mean
+
+	# Resample binary AU-presence columns by nearest original sample (no
+	# smoothing, no linear blending) so the 0/1 detections are preserved exactly.
+	presence_data: Dict[str, np.ndarray] = {}
+	for col in presence_cols:
+		y = pd.to_numeric(df_sorted[col], errors="coerce").to_numpy(dtype=float)
+		presence_data[col] = _nearest_onto(times_rel, y, new_rel)
 
 	# Align non-numeric columns by nearest original time
 	nonnum_df = pd.DataFrame({})
@@ -236,6 +297,8 @@ def resample_to_target(df: pd.DataFrame, src_fps: float, target_fps: float = 24.
 		elif fr_col and col == fr_col:
 			# Generate new sequential frame indices starting at 0
 			out_cols[col] = np.arange(n_new, dtype=int)
+		elif col in presence_data:
+			out_cols[col] = presence_data[col]
 		elif col in interp_data:
 			out_cols[col] = interp_data[col]
 		elif non_numeric_cols and col in nonnum_df.columns:

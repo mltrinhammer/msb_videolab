@@ -45,3 +45,5 @@ For the R scripts used in some folders, install the required packages from withi
 
 If you want, you can also create and use an R project in RStudio which manages library paths per-project.
 
+# Acknowledgements
+All the code has been written by me, Martin Lund Trinhammer (MLT). It has been agreed with the users of this repo at MSB that any subsequent publications that might use any of the code in the present repo will offer co-authorship to MLT
